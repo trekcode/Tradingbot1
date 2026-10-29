@@ -2,22 +2,38 @@ import os
 import time
 from tickerall import Tickerall
 
-# ---- Load secrets from environment ----
+# ---- Secrets from Deplexo Env Vars ----
 API_KEY = os.getenv("TICKERALL_API_KEY")
 SERVER = os.getenv("EXNESS_SERVER")
 ACCOUNT = int(os.getenv("EXNESS_ACCOUNT", "0"))
 PASSWORD = os.getenv("EXNESS_PASSWORD")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 
-# ---- Strategy Settings ----
-SYMBOL = "XAUUSDm"
+# ---- Symbols & Strategy Config ----
+SYMBOLS = [
+    "XAUUSDm",   # Gold
+    "EURUSDm",
+    "GBPUSDm",
+    "USDJPYm",
+    "AUDUSDm",
+    "USDCADm",
+]
 TIMEFRAME = "M5"
 FAST_MA = 10
 SLOW_MA = 30
 VOLUME = 0.01
-SL_DISTANCE = 5.0
-TP_DISTANCE = 10.0
-MAX_POSITIONS = 5          # <-- allow up to 5 concurrent trades
+
+# ---- Risk Rules ----
+MAX_TOTAL_POSITIONS = 5      # Hard cap across all symbols
+MAX_PER_SYMBOL = 1           # Only one position per pair/gold
+
+# Gold risk (price units)
+GOLD_SL = 5.0
+GOLD_TP = 10.0
+
+# FX risk (pips)
+FX_SL_PIPS = 10
+FX_TP_PIPS = 20
 
 def connect():
     client = Tickerall(api_key=API_KEY)
@@ -34,15 +50,17 @@ def get_ma(prices, period):
         return None
     return sum(prices[-period:]) / period
 
-def get_signal(client, account_id):
+def get_signal(client, account_id, symbol):
+    """Returns 'BUY', 'SELL', or None based on closed M5 candles."""
     try:
         bars = client.candles.get(
             account_id,
-            symbol=SYMBOL,
+            symbol=symbol,
             hours=24,
             timeframe=TIMEFRAME,
         )
-        closes = [bar.close for bar in bars]
+        # Use only CLOSED bars (ignore the current forming bar)
+        closes = [bar.close for bar in bars[:-1]]
         if len(closes) < SLOW_MA + 1:
             return None
 
@@ -60,67 +78,105 @@ def get_signal(client, account_id):
             return "SELL"
         return None
     except Exception as e:
-        print(f"❌ Signal error: {e}", flush=True)
+        print(f"❌ Signal error for {symbol}: {e}", flush=True)
         return None
 
-def count_open_positions(client, account_id):
-    """Return number of open XAUUSDm positions."""
-    try:
-        detail = client.accounts.get(account_id)
-        if detail.positions:
-            return sum(1 for p in detail.positions if getattr(p, "symbol", "") == SYMBOL)
-    except Exception as e:
-        print(f"❌ Position check error: {e}", flush=True)
-    return 0
+def get_pip_size(spec):
+    """Return pip size in price units for a symbol spec."""
+    # For 5-digit FX and 3-digit JPY pairs, pip = 10 * point.
+    # For gold (digits=3), we handle risk separately.
+    return spec.point * 10
+
+def calculate_sl_tp(symbol, side, entry_price, spec):
+    """Return (stop_loss, take_profit) price levels."""
+    if symbol == "XAUUSDm":
+        sl_dist = GOLD_SL
+        tp_dist = GOLD_TP
+    else:
+        pip = get_pip_size(spec)
+        sl_dist = FX_SL_PIPS * pip
+        tp_dist = FX_TP_PIPS * pip
+
+    if side == "BUY":
+        return round(entry_price - sl_dist, spec.digits), round(entry_price + tp_dist, spec.digits)
+    else:
+        return round(entry_price + sl_dist, spec.digits), round(entry_price - tp_dist, spec.digits)
+
+def count_positions(detail):
+    """Return (total_open, set_of_symbols_with_open_positions)."""
+    if not detail.positions:
+        return 0, set()
+    symbols_open = {p.symbol for p in detail.positions}
+    return len(detail.positions), symbols_open
 
 def main():
-    print("🚀 Scalping Bot starting (max 5 positions)...", flush=True)
+    print("🚀 Multi-Symbol Scalping Bot starting...", flush=True)
     client, session = connect()
     print(f"✅ Connected: {session.account_id} (demo={session.is_demo})", flush=True)
 
+    # Fetch symbol specs once
+    specs = {s.symbol: s for s in client.accounts.symbol_specs(session.account_id)}
+    for sym in SYMBOLS:
+        if sym not in specs:
+            print(f"⚠️ Spec not found for {sym} — will skip this symbol", flush=True)
+
     while True:
         try:
-            open_count = count_open_positions(client, session.account_id)
-            print(f"📊 Open {SYMBOL} positions: {open_count}/{MAX_POSITIONS}", flush=True)
+            detail = client.accounts.get(session.account_id)
+            total_open, symbols_open = count_positions(detail)
 
-            # Stop opening new trades once we reach 5
-            if open_count >= MAX_POSITIONS:
-                print("🛑 Max positions reached — monitoring only", flush=True)
+            # Hard cap check
+            if total_open >= MAX_TOTAL_POSITIONS:
+                print(f"🛑 Max total positions ({MAX_TOTAL_POSITIONS}) reached — monitoring only", flush=True)
                 time.sleep(POLL_SECONDS)
                 continue
 
-            signal = get_signal(client, session.account_id)
-            if signal is None:
-                print("⏳ No signal yet — waiting...", flush=True)
-                time.sleep(POLL_SECONDS)
-                continue
+            for symbol in SYMBOLS:
+                if symbol not in specs:
+                    continue
 
-            bars = client.candles.get(
-                session.account_id,
-                symbol=SYMBOL,
-                hours=1,
-                timeframe=TIMEFRAME,
-            )
-            last_price = bars[-1].close
+                # Per-symbol cap
+                if symbol in symbols_open:
+                    print(f"⏸️ {symbol}: position already open — skipping", flush=True)
+                    continue
 
-            if signal == "BUY":
-                sl = round(last_price - SL_DISTANCE, 3)
-                tp = round(last_price + TP_DISTANCE, 3)
-            else:
-                sl = round(last_price + SL_DISTANCE, 3)
-                tp = round(last_price - TP_DISTANCE, 3)
+                signal = get_signal(client, session.account_id, symbol)
+                if signal is None:
+                    print(f"⏳ {symbol}: no signal", flush=True)
+                    continue
 
-            print(f"🎯 Signal: {signal} @ {last_price} | SL={sl} TP={tp}", flush=True)
-            order = client.orders.place(
-                session.account_id,
-                type="market",
-                symbol=SYMBOL,
-                side=signal,
-                volume=VOLUME,
-                stop_loss=sl,
-                take_profit=tp,
-            )
-            print(f"✅ Order placed! Ticket: {order.ticket} | Status: {order.status}", flush=True)
+                # Get latest price for entry
+                bars = client.candles.get(
+                    session.account_id,
+                    symbol=symbol,
+                    hours=1,
+                    timeframe=TIMEFRAME,
+                )
+                entry_price = bars[-1].close
+                sl, tp = calculate_sl_tp(symbol, signal, entry_price, specs[symbol])
+
+                print(f"🎯 {symbol}: {signal} @ {entry_price} | SL={sl} TP={tp}", flush=True)
+
+                order = client.orders.place(
+                    session.account_id,
+                    type="market",
+                    symbol=symbol,
+                    side=signal,
+                    volume=VOLUME,
+                    stop_loss=sl,
+                    take_profit=tp,
+                )
+                print(f"✅ Order placed! {symbol} Ticket: {order.ticket} | Status: {order.status}", flush=True)
+
+                # Refresh positions after placing to respect the cap immediately
+                detail = client.accounts.get(session.account_id)
+                total_open, symbols_open = count_positions(detail)
+                if total_open >= MAX_TOTAL_POSITIONS:
+                    print(f"🛑 Reached {MAX_TOTAL_POSITIONS} positions — stopping signal scan this cycle", flush=True)
+                    break
+
+                # Small pause between orders to avoid rate spikes
+                time.sleep(2)
 
         except Exception as e:
             print(f"❌ Main loop error: {e}", flush=True)
