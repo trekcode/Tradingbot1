@@ -1,203 +1,305 @@
 import os
 import time
+import datetime
+from zoneinfo import ZoneInfo
+import pandas as pd
+import numpy as np
 from tickerall import Tickerall
 
-# ---- Load secrets from environment ----
+# ==========================================
+# 1. CONFIGURATION (Load from Environment Variables)
+# ==========================================
 API_KEY = os.getenv("TICKERALL_API_KEY")
 SERVER = os.getenv("EXNESS_SERVER")
 ACCOUNT = int(os.getenv("EXNESS_ACCOUNT", "0"))
 PASSWORD = os.getenv("EXNESS_PASSWORD")
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
 
-# ---- Symbols & Strategy Config (scalper) ----
-SYMBOLS = ["XAUUSDm", "EURUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm", "USDCADm"]
-TIMEFRAME = "M1"
-FAST_MA = 5
-SLOW_MA = 13
-LOOKBACK_HOURS = 4          # 240 M1 bars, far more than SLOW_MA + 2 needed
-MIN_BARS = SLOW_MA + 2      # closed bars needed for current + previous MA
-VOLUME = 0.01
+# Risk Management
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01")) # 1% of account
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "0.05")) # 5% max daily loss
+GOTTOBI_AMPLIFIER = float(os.getenv("GOTTOBI_AMPLIFIER", "1.5")) # Increase size by 50% on Gotobi
 
-MAX_TOTAL_POSITIONS = 5
-MAX_PER_SYMBOL = 1
+# General Loop Settings
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60")) # Check every 60 seconds
 
-GOLD_SL = 2.0
-GOLD_TP = 3.0
-FX_SL_PIPS = 5
-FX_TP_PIPS = 8
+# Tokyo Timezone Setup (Crucial for Strategy 1)
+TOKYO_TZ = ZoneInfo("Asia/Tokyo")
 
-# Optional: skip trading when the bot hasn't seen a new closed bar
-last_bar_traded = {}
+# ==========================================
+# 2. RISK MANAGER
+# ==========================================
+class RiskManager:
+    @staticmethod
+    def calculate_atr(df, period=14):
+        high_low = df['high'] - df['low']
+        high_close = np.abs(df['high'] - df['close'].shift())
+        low_close = np.abs(df['low'] - df['close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        return true_range.rolling(period).mean().iloc[-1]
 
+    @staticmethod
+    def calculate_volume(balance, risk_pct, sl_distance, spec, amplifier=1.0):
+        # Value per point movement for 1 lot
+        point_value = spec.tick_value / spec.tick_size
+        risk_amount = balance * risk_pct
+        
+        # Volume = Risk $ / (SL Distance in points * Point Value)
+        sl_points = sl_distance / spec.point
+        raw_volume = risk_amount / (sl_points * point_value)
+        
+        # Apply amplifier (e.g., Gotobi) and round to nearest 0.01
+        adjusted_volume = raw_volume * amplifier
+        volume = max(spec.volume_min, round(adjusted_volume, 2))
+        return min(volume, spec.volume_max)
 
-def connect():
-    client = Tickerall(api_key=API_KEY)
-    session = client.sessions.keep_alive(
-        broker="mt5",
-        server=SERVER,
-        account=ACCOUNT,
-        password=PASSWORD,
-    )
-    return client, session
+# ==========================================
+# 3. DATA FEED
+# ==========================================
+class DataFeed:
+    def __init__(self, client, account_id):
+        self.client = client
+        self.account_id = account_id
 
-
-def get_ma(prices, period):
-    if len(prices) < period:
-        return None
-    return sum(prices[-period:]) / period
-
-
-def bar_id_of(bar):
-    """Identify a bar by its timestamp; fall back to a 1-minute bucket."""
-    for attr in ("time", "timestamp", "t", "open_time"):
-        val = getattr(bar, attr, None)
-        if val is not None:
-            return str(val)
-    return str(int(time.time() // 60))
-
-
-def get_signal(client, account_id, symbol):
-    """
-    Returns (signal, entry_price, bar_id) or (None, None, None).
-    Crossover is evaluated on CLOSED bars only (forming bar excluded).
-    """
-    try:
-        bars = client.candles.get(
-            account_id, symbol=symbol, hours=LOOKBACK_HOURS, timeframe=TIMEFRAME
-        )
-        if not bars or len(bars) < MIN_BARS + 1:
-            print(f"⚠️ {symbol}: only {len(bars) if bars else 0} bars", flush=True)
-            return None, None, None
-
-        closed = bars[:-1]
-        closes = [b.close for b in closed]
-
-        fast_now = get_ma(closes, FAST_MA)
-        slow_now = get_ma(closes, SLOW_MA)
-        fast_prev = get_ma(closes[:-1], FAST_MA)
-        slow_prev = get_ma(closes[:-1], SLOW_MA)
-        if None in (fast_now, slow_now, fast_prev, slow_prev):
-            return None, None, None
-
-        print(
-            f"📈 {symbol}: fast={fast_now:.5f} slow={slow_now:.5f} "
-            f"(prev {fast_prev:.5f}/{slow_prev:.5f})",
-            flush=True,
-        )
-
-        signal = None
-        if fast_prev <= slow_prev and fast_now > slow_now:
-            signal = "BUY"
-        elif fast_prev >= slow_prev and fast_now < slow_now:
-            signal = "SELL"
-
-        if signal is None:
-            return None, None, None
-
-        entry_price = bars[-1].close  # latest price from the forming bar
-        return signal, entry_price, bar_id_of(closed[-1])
-
-    except Exception as e:
-        print(f"❌ Signal error for {symbol}: {e}", flush=True)
-        return None, None, None
-
-
-def get_pip_size(spec):
-    return spec.point * 10
-
-
-def calculate_sl_tp(symbol, side, entry_price, spec):
-    if symbol == "XAUUSDm":
-        sl_dist, tp_dist = GOLD_SL, GOLD_TP
-    else:
-        pip = get_pip_size(spec)
-        sl_dist, tp_dist = FX_SL_PIPS * pip, FX_TP_PIPS * pip
-    if side == "BUY":
-        return (
-            round(entry_price - sl_dist, spec.digits),
-            round(entry_price + tp_dist, spec.digits),
-        )
-    return (
-        round(entry_price + sl_dist, spec.digits),
-        round(entry_price - tp_dist, spec.digits),
-    )
-
-
-def count_positions(detail):
-    if not detail.positions:
-        return 0, {}
-    per_symbol = {}
-    for p in detail.positions:
-        per_symbol[p.symbol] = per_symbol.get(p.symbol, 0) + 1
-    return len(detail.positions), per_symbol
-
-
-def main():
-    print("🚀 Multi-Symbol Scalping Bot starting...", flush=True)
-    client, session = connect()
-    print(f"✅ Connected: {session.account_id} (demo={session.is_demo})", flush=True)
-
-    try:
-        specs = {s.name: s for s in client.accounts.symbol_specs(session.account_id)}
-    except Exception as e:
-        print(f"❌ Failed to fetch symbol specs: {e}", flush=True)
-        return
-
-    for sym in SYMBOLS:
-        if sym not in specs:
-            print(f"⚠️ Spec not found for {sym} — will skip", flush=True)
-
-    while True:
+    def get_candles_df(self, symbol, timeframe="M5", hours=24):
         try:
-            detail = client.accounts.get(session.account_id)
-            total_open, per_symbol = count_positions(detail)
-
-            if total_open >= MAX_TOTAL_POSITIONS:
-                print(f"🛑 Max positions ({MAX_TOTAL_POSITIONS}) reached — monitoring only", flush=True)
-                time.sleep(POLL_SECONDS)
-                continue
-
-            for symbol in SYMBOLS:
-                if symbol not in specs:
-                    continue
-                if per_symbol.get(symbol, 0) >= MAX_PER_SYMBOL:
-                    continue
-
-                signal, entry_price, bar_id = get_signal(client, session.account_id, symbol)
-                if signal is None:
-                    continue
-
-                # Don't re-enter on the same crossover bar
-                if last_bar_traded.get(symbol) == bar_id:
-                    continue
-
-                sl, tp = calculate_sl_tp(symbol, signal, entry_price, specs[symbol])
-                print(f"🎯 {symbol}: {signal} @ {entry_price} | SL={sl} TP={tp}", flush=True)
-
-                order = client.orders.place(
-                    session.account_id,
-                    type="market",
-                    symbol=symbol,
-                    side=signal,
-                    volume=VOLUME,
-                    stop_loss=sl,
-                    take_profit=tp,
-                )
-                last_bar_traded[symbol] = bar_id
-                print(f"✅ Order placed! {symbol} Ticket: {order.ticket}", flush=True)
-
-                detail = client.accounts.get(session.account_id)
-                total_open, per_symbol = count_positions(detail)
-                if total_open >= MAX_TOTAL_POSITIONS:
-                    print(f"🛑 Reached {MAX_TOTAL_POSITIONS} positions — stopping this cycle", flush=True)
-                    break
-                time.sleep(1)
-
+            bars = self.client.candles.get(
+                self.account_id, symbol=symbol, hours=hours, timeframe=timeframe
+            )
+            data = [{"time": b.time, "open": b.open, "high": b.high, "low": b.low, "close": b.close} for b in bars]
+            df = pd.DataFrame(data)
+            return df
         except Exception as e:
-            print(f"❌ Main loop error: {e}", flush=True)
+            print(f"❌ Data fetch error for {symbol}: {e}", flush=True)
+            return pd.DataFrame()
 
-        time.sleep(POLL_SECONDS)
+# ==========================================
+# 4. STRATEGIES
+# ==========================================
+class StrategyTokyoFix:
+    @staticmethod
+    def is_gotobi(dt):
+        # Japanese dates ending in 0 or 5
+        return dt.day % 10 in [0, 5]
 
+    @staticmethod
+    def check_signal(df, current_time):
+        """
+        Expects M1 (1-minute) data for USDJPY or GBPJPY.
+        Checks if it's time to trade.
+        """
+        if df.empty:
+            return None, 1.0
+            
+        # Filter for today's data
+        df['dt'] = pd.to_datetime(df['time'], unit='s', utc=True).dt.tz_convert(TOKYO_TZ)
+        today = current_time.date()
+        today_df = df[df['dt'].dt.date == today]
+        
+        if today_df.empty:
+            return None, 1.0
+
+        # Get 08:30 and 09:55 prices
+        price_0830 = today_df[today_df['dt'].dt.strftime('%H:%M') == '08:30']['close']
+        price_0955 = today_df[today_df['dt'].dt.strftime('%H:%M') == '09:55']['close']
+        
+        if price_0830.empty or price_0955.empty:
+            return None, 1.0
+
+        p_0830 = price_0830.iloc[0]
+        p_0955 = price_0955.iloc[0]
+        
+        # Only trigger exactly at 09:55
+        if current_time.strftime('%H:%M') == '09:55':
+            if p_0955 > p_0830:
+                # Price went up, we fade (SELL)
+                amplifier = GOTTOBI_AMPLIFIER if StrategyTokyoFix.is_gotobi(current_time) else 1.0
+                print(f"🎯 Tokyo Fix Signal: SELL (0830: {p_0830}, 0955: {p_0955}) | Gotobi: {amplifier > 1.0}", flush=True)
+                return "SELL", amplifier
+                
+        return None, 1.0
+
+class StrategyGoldMA:
+    @staticmethod
+    def check_signal(df):
+        """
+        Expects M5 data. Checks 44/332 SMA crossover.
+        """
+        if len(df) < 333:
+            return None # Not enough data
+            
+        df['SMA_44'] = df['close'].rolling(window=44).mean()
+        df['SMA_332'] = df['close'].rolling(window=332).mean()
+        
+        # Check crossover on the last closed candle
+        prev_fast = df['SMA_44'].iloc[-2]
+        prev_slow = df['SMA_332'].iloc[-2]
+        curr_fast = df['SMA_44'].iloc[-1]
+        curr_slow = df['SMA_332'].iloc[-1]
+        
+        if prev_fast <= prev_slow and curr_fast > curr_slow:
+            print("🎯 Gold MA Signal: BUY (44 crossed above 332)", flush=True)
+            return "BUY"
+        elif prev_fast >= prev_slow and curr_fast < curr_slow:
+            print("🎯 Gold MA Signal: SELL (44 crossed below 332)", flush=True)
+            return "SELL"
+            
+        return None
+
+# ==========================================
+# 5. EXECUTION ENGINE
+# ==========================================
+class TradingEngine:
+    def __init__(self):
+        self.client = Tickerall(api_key=API_KEY)
+        self.session = None
+        self.specs = {}
+        self.daily_start_balance = 0.0
+        self.last_trade_date = None
+        self.active_time_exits = {} # Track trades that need a time-based exit
+
+    def connect(self):
+        print("🚀 Connecting to Exness via TickerAll...", flush=True)
+        self.session = self.client.sessions.keep_alive(
+            broker="mt5", server=SERVER, account=ACCOUNT, password=PASSWORD
+        )
+        self.specs = {s.name: s for s in self.client.accounts.symbol_specs(self.session.account_id)}
+        detail = self.client.accounts.get(self.session.account_id)
+        self.daily_start_balance = detail.account.balance
+        print(f"✅ Connected. Balance: {self.daily_start_balance} {detail.account.currency}", flush=True)
+
+    def get_open_positions(self):
+        detail = self.client.accounts.get(self.session.account_id)
+        return detail.positions if detail.positions else []
+
+    def check_daily_loss(self):
+        detail = self.client.accounts.get(self.session.account_id)
+        current_equity = detail.account.equity
+        loss_pct = (self.daily_start_balance - current_equity) / self.daily_start_balance
+        if loss_pct >= MAX_DAILY_LOSS:
+            print(f"🛑 MAX DAILY LOSS REACHED ({loss_pct*100:.2f}%). Halting trading.", flush=True)
+            return True
+        return False
+
+    def execute_trade(self, symbol, side, df, strategy_name, amplifier=1.0):
+        if self.check_daily_loss():
+            return
+
+        # Prevent overlapping positions
+        open_positions = self.get_open_positions()
+        if any(p.symbol == symbol for p in open_positions):
+            print(f"⏸️ {symbol}: Position already open. Skipping {strategy_name}.", flush=True)
+            return
+
+        spec = self.specs[symbol]
+        atr = RiskManager.calculate_atr(df, period=14)
+        
+        if pd.isna(atr) or atr == 0:
+            print(f"❌ {symbol}: ATR calculation failed.", flush=True)
+            return
+
+        # Risk logic: SL = 1.5x ATR, TP = 2.0x ATR
+        sl_dist = atr * 1.5
+        tp_dist = atr * 2.0
+        entry_price = df['close'].iloc[-1]
+
+        if side == "BUY":
+            sl = round(entry_price - sl_dist, spec.digits)
+            tp = round(entry_price + tp_dist, spec.digits)
+        else: # SELL
+            sl = round(entry_price + sl_dist, spec.digits)
+            tp = round(entry_price - tp_dist, spec.digits)
+
+        volume = RiskManager.calculate_volume(self.daily_start_balance, RISK_PER_TRADE, sl_dist, spec, amplifier)
+
+        print(f"📤 Placing {side} {volume} lots on {symbol} | Entry: {entry_price} | SL: {sl} | TP: {tp}", flush=True)
+        
+        try:
+            order = self.client.orders.place(
+                self.session.account_id,
+                type="market",
+                symbol=symbol,
+                side=side,
+                volume=volume,
+                stop_loss=sl,
+                take_profit=tp
+            )
+            print(f"✅ Order successful! Ticket: {order.ticket}", flush=True)
+            
+            # Register time-exit for Tokyo Fix (exit 60 mins later)
+            if strategy_name == "TokyoFix":
+                self.active_time_exits[symbol] = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=60)
+                print(f"⏱️ Time-exit registered for {symbol} in 60 minutes.", flush=True)
+                
+        except Exception as e:
+            print(f"❌ Order execution failed for {symbol}: {e}", flush=True)
+
+    def manage_time_exits(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        to_remove = []
+        open_positions = self.get_open_positions()
+
+        for symbol, exit_time in self.active_time_exits.items():
+            if now >= exit_time:
+                print(f"⏰ Time exit reached for {symbol}. Closing position.", flush=True)
+                for p in open_positions:
+                    if p.symbol == symbol:
+                        try:
+                            self.client.positions.close(self.session.account_id, ticket=p.ticket)
+                            print(f"✅ Closed {symbol} ticket {p.ticket}", flush=True)
+                        except Exception as e:
+                            print(f"❌ Failed to close {symbol}: {e}", flush=True)
+                to_remove.append(symbol)
+        
+        for sym in to_remove:
+            del self.active_time_exits[sym]
+
+    def run(self):
+        self.connect()
+        feed = DataFeed(self.client, self.session.account_id)
+
+        while True:
+            try:
+                now_jst = datetime.datetime.now(TOKYO_TZ)
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                
+                # Reset daily balance tracker at JST midnight
+                if self.last_trade_date != now_jst.date():
+                    self.last_trade_date = now_jst.date()
+                    self.daily_start_balance = self.client.accounts.get(self.session.account_id).account.balance
+                    print(f"🌅 New Day. Reset daily loss limit. Balance: {self.daily_start_balance}", flush=True)
+
+                # 1. Manage Exits First
+                self.manage_time_exits()
+
+                # 2. Strategy 1: Tokyo Fix (USDJPY, GBPJPY) - Only run Mon-Fri
+                if now_jst.weekday() < 5: 
+                    for fx_pair in ["USDJPYm", "GBPJPYm"]:
+                        # We only need M1 data for this specific intraday strategy
+                        df_m1 = feed.get_candles_df(fx_pair, timeframe="M1", hours=12)
+                        signal, amplifier = StrategyTokyoFix.check_signal(df_m1, now_jst)
+                        if signal:
+                            self.execute_trade(fx_pair, signal, df_m1, "TokyoFix", amplifier)
+
+                # 3. Strategy 2: Gold 44/332 MA (XAUUSDm)
+                # We fetch M5 data. 332 periods * 5m = ~28 hours of data needed.
+                df_m5 = feed.get_candles_df("XAUUSDm", timeframe="M5", hours=48)
+                signal = StrategyGoldMA.check_signal(df_m5)
+                if signal:
+                    self.execute_trade("XAUUSDm", signal, df_m5, "GoldMA")
+
+                print(f"💤 Cycle complete. Sleeping for {POLL_INTERVAL}s...", flush=True)
+                time.sleep(POLL_INTERVAL)
+
+            except Exception as e:
+                print(f"❌ Main Loop Error: {e}", flush=True)
+                time.sleep(10)
+                # Attempt reconnect on main loop crash
+                try:
+                    self.connect()
+                except:
+                    pass
 
 if __name__ == "__main__":
-    main()
+    engine = TradingEngine()
+    engine.run()
